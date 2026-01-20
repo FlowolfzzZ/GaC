@@ -15,6 +15,7 @@ from transformers.generation import (
 )
 from transformers.generation.utils import *
 from transformers.generation.utils import GenerateOutput, GreedySearchOutput
+from transformers.utils.import_utils import is_torchdynamo_compiling
 
 from .logger import setup_custom_logger
 
@@ -229,7 +230,7 @@ def update_input_ids_and_model_kwargs(model, state):
 
     # Check if pad_token_id is provided
     if pad_token_id is None:
-        raise ValueError("pad_token_id must be defined.")
+        pad_token_id = eos_token_id_tensor[0].item()
 
     # Replace next_tokens with pad_token_id where sequences are finished
     next_tokens = [
@@ -690,12 +691,12 @@ def merge_and_convert_tokens(
     if need_ensemble:
         for output, mapping_matrix in zip(outputs, mapping_matrices):
             # Evert outputs of all models will be mapped
-            transformed_probs = torch.sparse.mm(output, mapping_matrix)
+            transformed_probs = torch.sparse.mm(output.float(), mapping_matrix.float())
             merged_probs += transformed_probs
     else:
         # Only process the output at the primary_index
         transformed_probs = torch.sparse.mm(
-            outputs[primary_index], mapping_matrices[primary_index]
+            outputs[primary_index].float(), mapping_matrices[primary_index].float()
         )
         merged_probs += transformed_probs
         logger.info("GaC do not ensemble in this step.")
@@ -1065,7 +1066,45 @@ def greedy_search(
     #         else None
     #     )
 
-    model_kwargs = model._get_initial_cache_position(input_ids, model_kwargs)
+    # 解决版本问题，https://github.com/AlfredJamesLi/GaC_Qwen2.5-7B-OpenChat-3.5/commit/bfb130f2556a6e37fdb531032eead3ca96e14265
+    cache_pos_fn = model._get_initial_cache_position
+    sig = inspect.signature(cache_pos_fn)
+    
+    # 取得完整形参列表；若首个不是 self 就别裁掉
+    all_params = list(sig.parameters.keys())
+    if all_params and all_params[0] == "self":
+        pnames = all_params[1:]
+    else:
+        pnames = all_params
+    
+    try:
+        # 1. ver≥4.55：首参是 seq_length / length / position_ids（纯 int）
+        if pnames and pnames[0] in {"seq_length", "length", "position_ids"}:
+            model_kwargs = cache_pos_fn(
+                input_ids.shape[-1],
+                device=input_ids.device,
+                model_kwargs=model_kwargs,
+            )
+        # 2. ver=4.55-4.56：input_ids, device, model_kwargs
+        elif len(pnames) >= 3 and pnames[1] == "device":
+            model_kwargs = cache_pos_fn(
+                input_ids,
+                device=input_ids.device,
+                model_kwargs=model_kwargs,
+            )
+        # 3. ver=4.53-4.54 or ≤4.52：input_ids, model_kwargs
+        elif "model_kwargs" in pnames:
+            model_kwargs = cache_pos_fn(input_ids, model_kwargs)
+        # 4. older version: only input_ids
+        else:
+            model_kwargs = cache_pos_fn(input_ids)
+    except TypeError:
+        # Insurance fallback — try the two most common calls
+        try:
+            model_kwargs = cache_pos_fn(input_ids, model_kwargs)
+        except TypeError:
+            model_kwargs = cache_pos_fn(input_ids)
+
     if model.config.is_encoder_decoder:
         raise Exception("We only support decorder arch!")
 
@@ -1164,7 +1203,6 @@ def generate_prepare(
 ) -> Union[GenerateOutput, torch.LongTensor]:
 
     # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
-    model._validate_model_class()
     tokenizer = kwargs.pop(
         "tokenizer", None
     )  # Pull this out first, we only use it for stopping criteria
@@ -1172,7 +1210,6 @@ def generate_prepare(
         generation_config, **kwargs
     )
     model._validate_model_kwargs(model_kwargs.copy())
-    model._validate_assistant(assistant_model)
 
     # 2. Set generation parameters if not already defined
     if synced_gpus is None:
@@ -1391,10 +1428,6 @@ def generate_prepare(
             )
             use_dynamic_cache_by_default = True
 
-    model._validate_generated_length(
-        generation_config, input_ids_length, has_default_max_length
-    )
-
     # 7. determine generation mode
     generation_mode = generation_config.get_generation_mode(assistant_model)
 
@@ -1432,7 +1465,6 @@ def generate_prepare(
         generation_config=generation_config,
         stopping_criteria=stopping_criteria,
         tokenizer=tokenizer,
-        **kwargs,
     )
 
     # 11. run greedy search

@@ -44,7 +44,7 @@ class ModelGenerator:
 
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             quantization_config=quantization_config,
         )
@@ -193,6 +193,7 @@ class ModelGenerator:
                     tokenize=False,
                     add_generation_prompt=True,
                     return_tensors="pt",
+                    enable_thinking=False,
                 )
             else:
                 processed_text = chat[0]["content"]

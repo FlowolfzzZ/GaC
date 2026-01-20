@@ -5,6 +5,7 @@ import yaml
 import torch
 from .ray_actor import get_remote_model_generator_class
 from .gac_gen_utils import *
+import numpy as np
 
 def setup_model_actors_and_data(config: List[Dict], norm_type: str, threshold: float) -> Tuple[List[Any], List[Any], Set[str], List[Dict[int, int]], Dict[int, str], Dict[Any, str], List[Dict[str, int]], int]:
     """
