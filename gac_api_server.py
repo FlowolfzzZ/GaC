@@ -7,6 +7,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from utils.gac_gen_call import *
 from utils.gac_gen_utils import *
+import time
+import uuid
 
 
 @asynccontextmanager
@@ -60,13 +62,19 @@ args = parser.parse_args()
 app = FastAPI(lifespan=lifespan)
 
 
-class GenerateRequest(BaseModel):
-    messages_list: List[
-        List[Dict]
-    ]  # List of messages(conversations) for batch processing
+class Message(BaseModel):
+    role: str
+    content: str
+
+
+class CompletionRequest(BaseModel):
+    model: str = 'ensemble-model'
+    messages: List[Message]
     max_length: Optional[int] = Field(default=None)  # Optional maximum length
-    max_new_tokens: Optional[int] = Field(default=50)  # Specifying maximum new tokens
-    apply_chat_template: Optional[bool] = Field(default=False)
+    max_tokens: Optional[int] = Field(default=50)  # Specifying maximum new tokens
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = 1.0
+    apply_chat_template: Optional[bool] = Field(default=True)
     # For early stopping
     until: Optional[List[str]] = Field(default=None)
 
@@ -76,23 +84,31 @@ async def get_status():
     return {"status": "ready"}
 
 
-@app.post("/api/generate/")
-async def api_generate(request: GenerateRequest):
-    chat_list = request.messages_list
+@app.post("/v1/chat/completions")
+async def api_generate(request: CompletionRequest):
+    messages = [m.model_dump() for m in request.messages]
     max_length = request.max_length
-    max_new_tokens = request.max_new_tokens
+    max_tokens = request.max_tokens
+    temperature = request.temperature
+    top_p = request.top_p
     apply_chat_template = request.apply_chat_template
     until = request.until
 
-    length_param = (
-        {"max_length": max_length}
-        if max_length is not None
-        else {"max_new_tokens": max_new_tokens}
-    )
-
+    kwargs = {}
+    if max_length is not None:
+        kwargs["max_length"] = max_length
+    if max_tokens is not None:
+        kwargs["max_new_tokens"] = max_tokens
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if top_p is not None:
+        kwargs["top_p"] = top_p
+    
+    logger.info(f"Arguments: {kwargs}")
+    
     prepare_inputs = [
         model_actor.prepare_inputs_for_model.remote(
-            chat_list, min_max_position_embeddings, apply_chat_template
+            messages, min_max_position_embeddings, apply_chat_template
         )
         for model_actor in model_actors_list
     ]
@@ -111,14 +127,29 @@ async def api_generate(request: GenerateRequest):
         primary_index=primary_index,
         threshold=threshold,
         until=until,
-        **length_param,
+        **kwargs,
     )
 
     generated_texts = extract_generated_texts(tokenizers[0], input_ids_0, output)
 
     logger.info(f"Generated text:{generated_texts}")
 
-    return {"response": generated_texts}
+    return {
+        "id": f"cmpl-{uuid.uuid4().hex[:8]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": request.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": generated_texts[0].strip()
+                },
+                "finish_reason": "length"
+            }
+        ]
+    }
 
 
 if __name__ == "__main__":

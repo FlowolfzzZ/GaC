@@ -178,29 +178,28 @@ class ModelGenerator:
         return self.tokenizer
 
     def prepare_inputs_for_model(
-        self, chat_list, min_max_position_embeddings=4096, apply_chat_template=False
+        self, messages, min_max_position_embeddings=4096, apply_chat_template=False
     ):
         # Calculate the truncation length as 75% of the minimum max_position_embeddings
         truncation_length = int(min_max_position_embeddings * 0.75)
         input_texts = []
 
         # Apply the chat template and collect the processed text
-        for chat in chat_list:
-            if apply_chat_template:
-                # Assume the tokenizer has an apply_chat_template method
-                processed_text = self.tokenizer.apply_chat_template(
-                    chat,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    return_tensors="pt",
-                    enable_thinking=False,
-                )
-            else:
-                processed_text = chat[0]["content"]
-            input_texts.append(processed_text)
+        if apply_chat_template:
+            # Assume the tokenizer has an apply_chat_template method
+            processed_text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                enable_thinking=False,
+            )
+        else:
+            processed_text = messages[0]["content"]
+        input_texts.append(processed_text)
 
         self.inputs = self.tokenizer(
-            input_texts,
+            [processed_text],
             return_tensors="pt",
             padding=True,
             max_length=truncation_length,
