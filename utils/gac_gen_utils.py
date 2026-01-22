@@ -435,27 +435,15 @@ def get_vocab_union_and_mapping(tokenizers):
                 )
             del vocab[actual_tokens[0]]
 
-        # Detect usage of 'Ġ' and '▁'
-        g_prefix_count = sum(token.startswith("Ġ") for token in vocab)
-        u_prefix_count = sum(token.startswith("▁") for token in vocab)
 
         # Process tokens based on prefix type
-        if g_prefix_count > u_prefix_count:
-            # Handle tokens starting with 'Ġ'
-            for token, token_id in vocab.items():
-                processed_token = token.replace("Ġ", " ").replace("Ċ", "\n")
-                token_set.add(processed_token)
-                mapping[token_id] = processed_token
-        else:
-            # Handle tokens starting with '▁'
-            for token, token_id in vocab.items():
-                if token.startswith("▁"):
-                    processed_token = token.replace("▁", " ")
-                else:
-                    # For tokens without '▁', use the decode method
-                    processed_token = token  # tokenizer.decode([token_id])
-                token_set.add(processed_token)
-                mapping[token_id] = processed_token
+        # 采用tokenizer.decode而不采用基于前缀匹配的原始方案
+        # 解决qwen模型vocab.json中的字符和实际tokenizer encode/decode不一致的问题，例如vocab.json中第2293字符'âĢĶ'在实际使用中是以'—'保存的
+        # 使得merge_and_convert_tokens和process_and_log_model_outputs的处理保持一致
+        for token, token_id in vocab.items():
+            processed_token = tokenizer.decode([token_id], skip_special_tokens=False)
+            token_set.add(processed_token)
+            mapping[token_id] = processed_token
 
         # Merge into the total vocab_union
         vocab_union = vocab_union.union(token_set)
@@ -701,7 +689,7 @@ def merge_and_convert_tokens(
         merged_probs += transformed_probs
         logger.info("GaC do not ensemble in this step.")
 
-    max_token_indices = torch.argmax(merged_probs, dim=1)
+    max_token_indices = torch.argmax(merged_probs, dim=-1)
     max_tokens = [index_to_vocab[index.item()] for index in max_token_indices]
     logger.info(f"Token chosen by GaC: {str(max_tokens)}\n")
 
@@ -721,6 +709,11 @@ def merge_and_convert_tokens(
                     special_prefix_token[tokenizer],
                     byte_mappings_list[i],
                 )
+                if len(token_id) > 1:
+                    logger.warning(
+                        f"Warning: Token '{token}' is tokenized into multiple token IDs {token_id} by tokenizer {type(tokenizer)}."
+                    )
+                    token_id = token_id[:1]  # Take only the first token ID
 
             batch_token_ids[i].append(token_id)  # Append token IDs for each batch
 

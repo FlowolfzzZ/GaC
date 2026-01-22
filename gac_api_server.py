@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
 
 async def batch_worker():
     loop = asyncio.get_running_loop()
-    MAX_BATCH_SIZE = 16
+    MAX_BATCH_SIZE = 8
     BATCH_TIMEOUT = 2
 
     while True:
