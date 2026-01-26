@@ -18,7 +18,7 @@ lm_eval --model vllm \
   --batch_size 32 \
   --apply_chat_template \
   --log_samples \
-  --num_fewshot 4 \
+  --num_fewshot 0 \
   --output_path output \
   --gen_kwargs temperature=0.7,top_p=0.8,top_k=20,max_gen_toks=4096 \
   --wandb_args ${WANDB_ARGS}

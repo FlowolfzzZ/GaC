@@ -47,7 +47,7 @@ class ModelGenerator:
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             quantization_config=quantization_config,
-        )
+        ).eval()
 
         device_map = infer_auto_device_map(
             model,
@@ -180,6 +180,14 @@ class ModelGenerator:
     def prepare_inputs_for_model(
         self, batch_messages, min_max_position_embeddings=4096, apply_chat_template=False
     ):
+        if hasattr(self, "inputs"):
+            logger.warning("Deleted previous inputs to free up memory.")
+            del self.inputs
+        if hasattr(self, "state"):
+            logger.warning("Deleted previous state to free up memory.")
+            del self.state
+        torch.cuda.empty_cache()
+
         # Calculate the truncation length as 75% of the minimum max_position_embeddings
         truncation_length = int(min_max_position_embeddings * 0.75)
         input_texts = []
