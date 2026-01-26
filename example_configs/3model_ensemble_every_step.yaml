@@ -1,0 +1,31 @@
+# This is a configuration file assuming the availability of an 80GiB GPU (A100 or H100).
+# If you want to perform ensemble at each generation step, please ensure that the 'priority' for all models is set to 'supportive'. The threshold will be ignored.
+NORM_TYPE_API_SERVER: 'average' # 'average' or 'score', 'score' means each model's output vector in the GaC ensemble is weighted by its score divided by the total score.
+THRESHOLD_API_SERVER: 1.0
+CONFIG_API_SERVER:
+  - weight: 'Qwen/Qwen3-32B'
+    max_memory:
+      0: '80GiB'
+    num_gpus: 1
+    name: 'Qwen3-32B'
+    score: 100
+    priority: 'supportive'
+    quantization: 'none' # 'none'/'8bit'/'4bit'
+  
+  - weight: 'deepseek-ai/DeepSeek-R1-Distill-Qwen-32B'
+    max_memory:
+      0: '80GiB'
+    num_gpus: 1
+    name: 'DeepSeek-R1-Distill-Qwen-32B'
+    score: 100
+    priority: 'supportive'
+    quantization: 'none' # 'none'/'8bit'/'4bit'
+  
+  - weight: 'zai-org/GLM-4-32B-0414'
+    max_memory:
+      0: '80GiB'
+    num_gpus: 1
+    name: 'GLM-4-32B-0414'
+    score: 100
+    priority: 'supportive'
+    quantization: 'none' # 'none'/'8bit'/'4bit'
