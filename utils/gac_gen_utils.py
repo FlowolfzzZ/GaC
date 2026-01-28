@@ -435,7 +435,6 @@ def get_vocab_union_and_mapping(tokenizers):
                 )
             del vocab[actual_tokens[0]]
 
-
         # Process tokens based on prefix type
         # 采用tokenizer.decode而不采用基于前缀匹配的原始方案
         # 解决qwen模型vocab.json中的字符和实际tokenizer encode/decode不一致的问题，例如vocab.json中第2293字符'âĢĶ'在实际使用中是以'—'保存的
@@ -652,6 +651,7 @@ def merge_and_convert_tokens(
     """
     eos_token_list = [tokenizer.eos_token for tokenizer in tokenizers]
     eos_token_list.extend(["<|end_of_text|>", "<|endoftext|>", "<|im_end|>", "<|end|>"])
+    banned_token_set = {"<|user|>", "<think>", "</think>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>"}
 
     for i, output in enumerate(outputs):
         if need_ensemble:
@@ -689,8 +689,25 @@ def merge_and_convert_tokens(
         merged_probs += transformed_probs
         logger.info("GaC do not ensemble in this step.")
 
-    max_token_indices = torch.argmax(merged_probs, dim=-1)
-    max_tokens = [index_to_vocab[index.item()] for index in max_token_indices]
+    top_k = 10 
+    top_k_probs, top_k_indices = torch.topk(merged_probs, k=top_k, dim=-1)
+    max_tokens = []
+    batch_size = merged_probs.size(0)
+    for b in range(batch_size):
+        chosen_token = None
+        for k in range(top_k):
+            idx = top_k_indices[b, k].item()
+            token_str = index_to_vocab[idx]
+            if token_str not in banned_token_set:
+                chosen_token = token_str
+                break
+        # 如果前K个都在黑名单中（极少见），强制使用概率最高的那个作为兜底
+        if chosen_token is None:
+            idx = top_k_indices[b, 0].item()
+            chosen_token = index_to_vocab[idx]
+            logger.warning(f"All top-{top_k} tokens are banned. Forcing top-1: {chosen_token}")
+        max_tokens.append(chosen_token)
+    
     logger.info(f"Token chosen by GaC: {str(max_tokens)}\n")
 
     # Convert to token IDs for each tokenizer
