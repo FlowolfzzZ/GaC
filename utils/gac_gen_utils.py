@@ -1234,64 +1234,98 @@ def _core_row_entropy(x):
         x (torch.Tensor): shape (..., V), non-negative weights (need not sum to 1).
     Returns:
         torch.Tensor: shape (..., 1), the entropy of each normalized row.
+
+    Uses in-place log/mul so only two full-vocab temporaries (p and log p) are held; the
+    result is identical to ``-(p * log p).sum()``.
     """
     row_sum = x.sum(dim=-1, keepdim=True).clamp_min(_CORE_EPS)
     p = (x / row_sum).clamp_min(_CORE_EPS)
-    return -(p * torch.log(p)).sum(dim=-1, keepdim=True)
+    logp = p.log()
+    logp.mul_(p)                                   # p * log(p), in place
+    return logp.sum(dim=-1, keepdim=True).neg_()   # -sum(p log p)
 
 
-def compute_core_scores(aligned, variant, task_type, hparams):
+def compute_core_scores(aligned, variant, task_type, hparams, has_main=True):
     """Compute CoRE token- and model-level consistency scores.
 
     Faithful port of ``compute_consist_score`` from the official CoRE implementation
     (logits_processor.py), generalized to operate in GaC's union vocabulary and to
-    support a batch dimension. The main (anchor) model must be at row 0.
+    support a batch dimension.
+
+    Two modes:
+      * ``has_main=True`` (paper-faithful, anchored): the main model must be at row 0.
+        Token masking references the main, and the main weight is clipped to >= 0.5.
+      * ``has_main=False`` (symmetric): no anchor model. GaC fuses into a symmetric union
+        vocab, so this treats all models on equal footing — a shared candidate mask and no
+        dominance clip. ``score``/``NORM_TYPE`` then have no influence on CoRE.
 
     Args:
         aligned (torch.Tensor): shape (N, B, V) — each model's probability distribution
-            aligned to the union vocabulary, with the main model at index 0.
+            aligned to the union vocabulary (main at index 0 when ``has_main``).
         variant (str): consistency function, one of
             {consist-rbf, consist-power, consist-sig, consist-linear, consist-rec}.
         task_type (str): 'generation' or 'classification' (selects the model-weight formula).
         hparams (dict): consistency-function hyperparameters (beta/alpha/gamma/k).
+        has_main (bool): whether row 0 is a privileged anchor model.
 
     Returns:
         token_scores (torch.Tensor): shape (N, B, V), the token-level low-pass filter.
         model_scores (torch.Tensor): shape (N, B, 1), simplex-normalized model weights.
     """
-    # Reference (barycenter) distribution: uniform average across models (Eq. 1).
+    # Model confidence term (entropy) first, while no token-consistency buffers are allocated,
+    # and per model so its temporaries are (B,V) rather than (N,B,V). Result is a tiny (N,B,1).
+    p_ent = torch.stack(
+        [_core_row_entropy(aligned[i]) for i in range(aligned.size(0))], dim=0
+    )  # (N,B,1)
+
+    # Candidate mask first, kept as bool (1 byte vs 4). Its float temporary is freed before the
+    # large `diff` buffer is allocated, so the two full-vocab tensors never coexist (lower peak).
+    if has_main:
+        # Mask impossible tokens (no mass in either this model or the main model).
+        mask_tmp = aligned + aligned[0:1]
+    else:
+        # Symmetric: shared candidate mask over tokens with mass in any model.
+        mask_tmp = aligned + aligned.sum(dim=0, keepdim=True)
+    p_mask = mask_tmp > _CORE_EPS              # bool (N,B,V); 0/1 multiply == float mask
+    del mask_tmp
+
+    # Reference (barycenter) distribution (Eq. 1) and absolute deviation. Subtract into a
+    # buffer and take abs in place to avoid a second full-vocab allocation.
     p_star = aligned.mean(dim=0, keepdim=True)              # (1,B,V)
-    diff = torch.abs(aligned - p_star)                     # (N,B,V)
+    diff = aligned - p_star                                 # (N,B,V)
+    del p_star
+    diff.abs_()
 
-    # Mask impossible tokens (no mass in either this model or the main model).
-    p_mask = ((aligned + aligned[0:1]) > _CORE_EPS).float()  # (N,B,V)
-
+    # Compute token consistency in place on the `diff` buffer (not needed afterwards) to avoid
+    # allocating extra full-vocab tensors. Each step is elementwise-equivalent to the
+    # out-of-place form, so the returned scores are unchanged.
     if variant == "consist-linear":
-        token_scores = p_mask * (1 - diff)
+        token_scores = diff.mul_(-1.0).add_(1.0)                            # 1 - diff
     elif variant == "consist-power":
         alpha = hparams.get("alpha", 5.0)
-        token_scores = p_mask * (1 - diff).clamp(min=0) ** alpha
+        token_scores = diff.mul_(-1.0).add_(1.0).clamp_(min=0).pow_(alpha)  # (1 - diff)^alpha
     elif variant == "consist-rbf":
         beta = hparams.get("beta", 2.0)
-        beta_t = torch.tensor(beta, dtype=aligned.dtype, device=aligned.device)
-        token_scores = p_mask * (torch.exp(-beta * diff) - torch.exp(-beta_t)) / (1 - torch.exp(-beta_t))
+        enb = torch.exp(-torch.tensor(beta, dtype=aligned.dtype, device=aligned.device))
+        token_scores = diff.mul_(-beta).exp_().sub_(enb).div_(1 - enb)      # (e^{-b d}-e^{-b})/(1-e^{-b})
     elif variant == "consist-rec":
         gamma = hparams.get("gamma", 1.0)
-        tmp = 1 / (1 + gamma * diff)
-        token_scores = p_mask * (tmp - tmp.min()) / (tmp.max() - tmp.min() + 1e-8)
+        tmp = diff.mul_(gamma).add_(1.0).reciprocal_()                      # 1/(1+gamma*diff)
+        tmin, tmax = tmp.min(), tmp.max()
+        token_scores = tmp.sub_(tmin).div_(tmax - tmin + 1e-8)
     elif variant == "consist-sig":
         k = hparams.get("k", 5.0)
-        token_scores = p_mask * (1 - torch.sigmoid(k * (diff - 0.5)))
+        token_scores = diff.sub_(0.5).mul_(k).sigmoid_().neg_().add_(1.0)   # 1 - sigmoid(k*(diff-0.5))
     else:
         raise ValueError(f"Unknown CoRE variant {variant}")
+    token_scores.mul_(p_mask)   # apply candidate mask (bool broadcasts as 0/1), in place
+    del p_mask
 
     # Per-model (and per-batch) normalization to keep scores comparable across variants.
     # token_scores_sum (the raw sum) doubles as the numerator of the model-level score.
-    nonzero_count = (token_scores != 0).sum(dim=-1, keepdim=True).float()  # (N,B,1)
+    nonzero_count = (token_scores != 0).sum(dim=-1, keepdim=True).to(token_scores.dtype)  # (N,B,1)
     token_scores_sum = token_scores.sum(dim=-1, keepdim=True)              # (N,B,1)
-    token_scores = token_scores / (token_scores_sum + _CORE_EPS) * nonzero_count
-
-    p_ent = _core_row_entropy(aligned)  # (N,B,1)
+    token_scores.div_(token_scores_sum + _CORE_EPS).mul_(nonzero_count)    # in place
 
     # Model-level consistency: reward agreement (token_scores_sum) and confidence (1/entropy).
     if task_type == "generation":
@@ -1302,9 +1336,11 @@ def compute_core_scores(aligned, variant, task_type, hparams):
         raise ValueError(f"Unknown CoRE task_type {task_type}")
 
     # Clip the main model weight to preserve a strong anchor (>= 0.5 after normalization).
-    model_scores = model_scores.clone()
-    sum_excl_main = model_scores.sum(dim=0, keepdim=True) - model_scores[0:1]  # (1,B,1)
-    model_scores[0:1] = torch.maximum(model_scores[0:1], sum_excl_main)
+    # Skipped in symmetric mode so no model is forced to dominate.
+    if has_main:
+        model_scores = model_scores.clone()
+        sum_excl_main = model_scores.sum(dim=0, keepdim=True) - model_scores[0:1]  # (1,B,1)
+        model_scores[0:1] = torch.maximum(model_scores[0:1], sum_excl_main)
     model_scores = model_scores / model_scores.sum(dim=0, keepdim=True).clamp_min(_CORE_EPS)
 
     return token_scores, model_scores
@@ -1353,62 +1389,91 @@ def merge_and_convert_tokens_core(
     variant = core_cfg["variant"]
     hparams = core_cfg["hparams"]
     check_substring = core_cfg["check_substring"]
-    main_index = core_cfg["core_main_index"]
+    main_index = core_cfg["core_main_index"]   # None -> symmetric (no anchor model)
+    has_main = main_index is not None
 
     if need_ensemble:
         # Recover each model's unit-sum softmax (the actor bakes in the config weight, which
-        # CoRE replaces), then project into the union vocabulary via the GaC mapping matrices.
-        aligned_list = []
-        for output, mapping_matrix, weight in zip(outputs, mapping_matrices, ensemble_weight_list):
-            softmax_probs = output.float() / max(float(weight), _CORE_EPS)
-            aligned_list.append(torch.sparse.mm(softmax_probs, mapping_matrix.float()))  # (B, V)
+        # CoRE replaces) and project into the union vocab. Write each projection straight into
+        # a preallocated (N, B, V) buffer (anchor at row 0 when anchored) to avoid the extra
+        # full-vocab copy that building a list and calling torch.stack would incur.
+        n_models = len(outputs)
+        if has_main:
+            order = [main_index] + [i for i in range(n_models) if i != main_index]
+        else:
+            order = list(range(n_models))
 
-        # Put the anchor model at row 0 so the consistency math matches the paper's convention.
-        order = [main_index] + [i for i in range(len(aligned_list)) if i != main_index]
-        aligned = torch.stack([aligned_list[j] for j in order], dim=0)  # (N, B, V)
+        def _aligned_row(j):
+            softmax_probs = outputs[j].float() / max(float(ensemble_weight_list[j]), _CORE_EPS)
+            return torch.sparse.mm(softmax_probs, mapping_matrices[j].float())  # (B, V)
 
-        token_scores, model_scores = compute_core_scores(aligned, variant, task_type, hparams)
+        first = _aligned_row(order[0])
+        batch_size, vocab_size = first.shape
+        aligned = torch.empty(
+            n_models, batch_size, vocab_size, device=first.device, dtype=first.dtype
+        )
+        aligned[0] = first
+        del first
+        for row in range(1, n_models):
+            aligned[row] = _aligned_row(order[row])
 
-        # p_ens = w_main * p_main + sum_i w_i * (s^t_i (.) p_i); token consistency on assists only.
-        merged_probs = model_scores[0] * aligned[0]  # (B, V)
-        for i in range(1, aligned.size(0)):
+        token_scores, model_scores = compute_core_scores(
+            aligned, variant, task_type, hparams, has_main=has_main
+        )
+
+        # Anchored: p_ens = w_main*p_main + sum_i w_i*(s^t_i (.) p_i); token consistency on
+        # assists only. Symmetric: token consistency (generation) applies to every model.
+        # Accumulate in place so we never hold more than the (N,B,V) inputs plus the result.
+        if has_main:
+            merged_probs = model_scores[0] * aligned[0]  # main, no token-consistency filter
+            start = 1
+        else:
+            merged_probs = torch.zeros_like(aligned[0])
+            start = 0
+        for i in range(start, n_models):
             if task_type == "generation":
-                merged_probs = merged_probs + model_scores[i] * aligned[i] * token_scores[i]
+                merged_probs.add_(model_scores[i] * aligned[i] * token_scores[i])
             else:  # classification: model-level weighting only
-                merged_probs = merged_probs + model_scores[i] * aligned[i]
+                merged_probs.add_(model_scores[i] * aligned[i])
 
-        main_aligned = aligned[0]  # anchor distribution, for substring fallback
+        # Anchor top token (for substring fallback) before freeing the big tensors.
+        main_top_idx_cpu = (
+            torch.argmax(aligned[0], dim=-1).tolist()
+            if (has_main and check_substring and task_type == "generation")
+            else None
+        )
+        del aligned, token_scores, model_scores
     else:
         # Thresholded ensemble, primary model confident: fall back to the primary model only.
         merged_probs = torch.sparse.mm(
             outputs[primary_index].float(), mapping_matrices[primary_index].float()
         )
-        main_aligned = merged_probs
+        main_top_idx_cpu = None
         logger.info("GaC+CoRE do not ensemble in this step.")
 
-    top_k = 10
-    top_k_probs, top_k_indices = torch.topk(merged_probs, k=top_k, dim=-1)
-    use_substring = check_substring and need_ensemble and task_type == "generation"
+    top_k = min(10, merged_probs.size(-1))
+    _, top_k_indices = torch.topk(merged_probs, k=top_k, dim=-1)
+    use_substring = main_top_idx_cpu is not None
+    # Pull selection indices to CPU once to avoid per-token GPU syncs.
+    top_k_idx_cpu = top_k_indices.tolist()
+
     max_tokens = []
     batch_size = merged_probs.size(0)
     for b in range(batch_size):
         chosen_token = None
-        for k in range(top_k):
-            idx = top_k_indices[b, k].item()
+        for idx in top_k_idx_cpu[b]:
             token_str = index_to_vocab[idx]
             if token_str not in banned_token_set:
                 chosen_token = token_str
                 break
         if chosen_token is None:
-            idx = top_k_indices[b, 0].item()
-            chosen_token = index_to_vocab[idx]
+            chosen_token = index_to_vocab[top_k_idx_cpu[b][0]]
             logger.warning(f"All top-{top_k} tokens are banned. Forcing top-1: {chosen_token}")
 
         # CoRE substring resolution: if the ensemble token and the anchor model's top token
         # are prefixes of each other, keep the anchor token (avoids misalignment artifacts).
         if use_substring:
-            main_top_idx = torch.argmax(main_aligned[b]).item()
-            main_top_token = index_to_vocab[main_top_idx]
+            main_top_token = index_to_vocab[main_top_idx_cpu[b]]
             if (
                 main_top_token not in banned_token_set
                 and chosen_token != main_top_token

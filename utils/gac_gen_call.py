@@ -38,11 +38,6 @@ def setup_model_actors_and_data(config: List[Dict], norm_type: str, threshold: f
         - id_to_str_list (List[Dict[int, str]]): per-model token id -> canonical union string (UniTE).
         - str_to_ids_list (List[Dict[str, List[int]]]): per-model canonical union string -> token ids (UniTE).
     """
-    # Capture the user-specified raw scores BEFORE update_scores rewrites them (in
-    # 'average' mode every score becomes 1). CoRE uses the raw scores to pick its anchor
-    # ("main") model when no explicit CORE_MAIN_INDEX is given and no primary model exists.
-    raw_scores = [c.get('score', 1) for c in config]
-
     update_scores(config, norm_type)
     config = normalize_scores(config)
     logger.info(f"Model ensemble weights: {[(c['name'], round(c['score'],4)) for c in config]}")
@@ -50,9 +45,11 @@ def setup_model_actors_and_data(config: List[Dict], norm_type: str, threshold: f
     # find primary model
     primary_index = check_priorities(config)
 
-    # Resolve the CoRE anchor ("main") model. Priority: explicit CORE_MAIN_INDEX override >
-    # the gate model (primary_index) when set > the model with the highest raw config score
-    # (ties -> first). Only relevant when CoRE is enabled.
+    # Resolve the CoRE anchor ("main") model. CoRE here runs SYMMETRICALLY by default
+    # (no anchor) since GaC fuses into a symmetric union vocab; this avoids overloading the
+    # 'score' field and never forces a single model to dominate. An anchor (paper-faithful
+    # asymmetric CoRE) is used only when explicitly requested via CORE_MAIN_INDEX, or when a
+    # gate model is designated (priority: 'primary') — both are explicit choices, not 'score'.
     if core_cfg is not None and core_cfg.get('USE_CORE'):
         if core_cfg.get('main_index') is not None:
             core_main_index = core_cfg['main_index']
@@ -63,14 +60,21 @@ def setup_model_actors_and_data(config: List[Dict], norm_type: str, threshold: f
         elif primary_index != -1:
             core_main_index = primary_index
         else:
-            core_main_index = int(np.argmax(raw_scores))
+            core_main_index = None  # symmetric (no anchor)
         core_cfg['core_main_index'] = core_main_index
-        logger.info(
-            f"CORE_CONFIG | enabled | variant={core_cfg['variant']} "
-            f"| task_type={core_cfg['task_type']} "
-            f"| main_model={config[core_main_index]['name']} (index {core_main_index}) "
-            f"| check_substring={core_cfg['check_substring']} | hparams={core_cfg['hparams']}"
-        )
+        if core_main_index is None:
+            logger.info(
+                f"CORE_CONFIG | enabled | mode=symmetric (no main) "
+                f"| variant={core_cfg['variant']} | task_type={core_cfg['task_type']} "
+                f"| hparams={core_cfg['hparams']}"
+            )
+        else:
+            logger.info(
+                f"CORE_CONFIG | enabled | mode=anchored "
+                f"| main_model={config[core_main_index]['name']} (index {core_main_index}) "
+                f"| variant={core_cfg['variant']} | task_type={core_cfg['task_type']} "
+                f"| check_substring={core_cfg['check_substring']} | hparams={core_cfg['hparams']}"
+            )
     if primary_index != -1:
         real_threshold = threshold*config[primary_index]["score"]
         logger.info(f"Gate model is {config[primary_index]['name']} with threshold {threshold}, and other ensembled models KV cache will be disabled!\nPlease note that for threshold ensemble, we currently only support batch size = 1.")
@@ -384,9 +388,10 @@ def parse_core_config(config, ensemble_method):
     """
     Parse and validate the optional CoRE-related keys from a loaded YAML config.
 
-    Returns a dict with the resolved CoRE settings. ``core_main_index`` is left as the
-    user-provided override (or None) here; the concrete anchor model is resolved later in
-    ``setup_model_actors_and_data`` once priorities/raw scores are known.
+    Returns a dict with the resolved CoRE settings. ``main_index`` holds the user-provided
+    override (or None). The concrete anchor is resolved later in
+    ``setup_model_actors_and_data``: CoRE runs symmetrically (no main) by default, and only
+    uses an anchor when CORE_MAIN_INDEX is set or a gate model (priority: 'primary') exists.
     """
     use_core = config.get('USE_CORE', False)
     if not isinstance(use_core, bool):

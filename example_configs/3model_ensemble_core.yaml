@@ -1,16 +1,17 @@
 # This is a configuration file assuming the availability of an 80GiB GPU (A100 or H100).
 # If you want to perform ensemble at each generation step, please ensure that the 'priority' for all models is set to 'supportive'. The threshold will be ignored.
 # This config enables CoRE (Harnessing Consistency for Robust Test-Time LLM Ensemble) on top of GaC.
-NORM_TYPE_API_SERVER: 'average' # 'average' or 'score'. With CoRE the per-model weights are recomputed from consistency, so these weights are superseded (they still pick the anchor model by score when CORE_MAIN_INDEX is unset).
+NORM_TYPE_API_SERVER: 'average' # 'average' or 'score'. With CoRE the per-model weights are recomputed from consistency, so these values do not affect CoRE (in the default symmetric mode 'score' is fully ignored by CoRE).
 THRESHOLD_API_SERVER: 1.0
 ENSEMBLE_METHOD: 'gac' # CoRE augments the union-vocab GaC path. Must be 'gac' (or omitted); 'unite' is rejected with USE_CORE.
 
 # ---- CoRE settings ----
 USE_CORE: true # Enable GaC + CoRE. Default false -> identical to vanilla GaC.
 CORE_VARIANT: 'consist-rbf' # token consistency function: consist-rbf | consist-power | consist-sig | consist-linear | consist-rec
-CORE_TASK_TYPE: 'generation' # 'generation' (token consistency on assists + sum(token_score)/entropy weights) or 'classification' (1/entropy weights, no token-consistency filter)
-# CORE_MAIN_INDEX: 0 # optional: explicit anchor ("main") model index. If unset: gate model when present, else the model with the highest raw 'score' (ties -> first).
-CORE_CHECK_SUBSTRING: true # generation only: if the ensemble token and the anchor's top token are prefixes of each other, keep the anchor token.
+CORE_TASK_TYPE: 'generation' # 'generation' (token consistency + sum(token_score)/entropy weights) or 'classification' (1/entropy weights, no token-consistency filter)
+# CoRE runs SYMMETRICALLY by default (no main model): all models are treated equally, no model is forced to dominate, and 'score' is ignored by CoRE. This fits GaC's symmetric union vocab.
+CORE_MAIN_INDEX: 0 # optional: switch to paper-faithful anchored CoRE by pinning one model as the "main" (token consistency penalizes only the others; its weight is clipped to >= 0.5). A gate model (priority: 'primary') is also used as the anchor when present.
+CORE_CHECK_SUBSTRING: true # anchored generation only: if the ensemble token and the anchor's top token are prefixes of each other, keep the anchor token (ignored in symmetric mode).
 # Consistency-function hyperparameters (paper defaults shown):
 CORE_BETA: 2.0   # consist-rbf
 CORE_ALPHA: 5.0  # consist-power
@@ -23,7 +24,7 @@ CONFIG_API_SERVER:
       0: '80GiB'
     num_gpus: 1
     name: 'Qwen3-32B'
-    score: 100 # highest score -> CoRE anchor ("main") model when CORE_MAIN_INDEX is unset
+    score: 100 # ignored by CoRE in the default symmetric mode (weights come from consistency)
     priority: 'supportive'
     quantization: 'none'
 
