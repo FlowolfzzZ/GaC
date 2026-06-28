@@ -128,6 +128,10 @@ class ModelGenerator:
         if self.state["unfinished_sequences"].max() == 0:
             self.state["this_peer_finished"] = True
 
+        max_length = self.state.get("max_length")
+        if max_length is not None and self.state["input_ids"].shape[1] >= max_length:
+            self.state["this_peer_finished"] = True
+
         # stop if we exceed the maximum length
         if torch.all(
             self.state["stopping_criteria"](
@@ -150,9 +154,11 @@ class ModelGenerator:
         self.state["next_tokens_list"] = next_tokens_list
         (
             self.state["input_ids"],
-            self.state["modefl_kwargs"],
+            self.state["model_kwargs"],
             self.state["unfinished_sequences"],
         ) = update_input_ids_and_model_kwargs(self.model, self.state)
+        self.state["outputs"] = None
+        self.state["next_tokens_scores"] = None
 
     def get_one_token(self):
 

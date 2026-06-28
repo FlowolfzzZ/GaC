@@ -104,6 +104,9 @@ CONFIG_API_SERVER:
   - **quantization**: Whether to load the model with `4bit` or `8bit` quantization. Setting `'none'` will use the default data type specified in the huggingface model config.
 - **NORM_TYPE_API_SERVER**: Ensemble weight type, 'average' or 'score'. 'Score' means each model's output vector in the GaC ensemble is weighted by its score divided by the total score.
 - **THRESHOLD_API_SERVER**: Threshold for ensemble. This parameter is ineffective if all models are supportive.
+- **ENSEMBLE_METHOD** (optional, top-level): Which ensembling algorithm to use, `'gac'` (default) or `'unite'`. If omitted, the original GaC behavior is used. `'unite'` selects the [UniTE](https://github.com/starrYYxuan/UniTE) algorithm, which ensembles only over the union of each model's top-k tokens instead of the full union vocabulary.
+- **UNITE_TOP_K** (optional, top-level): The per-model top-k used by UniTE. Defaults to `10` (the UniTE paper's setting). Ignored when `ENSEMBLE_METHOD` is `'gac'`.
+- **UNITE_RENORM** (optional, top-level): Whether UniTE renormalizes each model's probabilities over the candidate set. Defaults to `false`: the absolute, model-weighted probabilities are summed over the candidate set (preserving each model's confidence, like GaC). Set to `true` for the original UniTE per-model `1/n` renormalization. Ignored when `ENSEMBLE_METHOD` is `'gac'`.
 </details>
 
 <details>
@@ -113,6 +116,7 @@ We have listed examples of ensembling SOLAR-10.7B-Instruct-v1.0 and openchat-3.5
 
 - **example_ensemble_every_step.yaml**: Ensembles at every generation step, ensuring each model's priority is 'supportive'. `THRESHOLD_API_SERVER` will be ignored.
 - **example_thresholded_ensemble.yaml**: Only ensembles at a generation step if the primary model's highest confidence token is below `THRESHOLD_API_SERVER`.
+- **3model_ensemble_unite.yaml**: Same setup as every-step ensembling, but selects the UniTE algorithm via `ENSEMBLE_METHOD: 'unite'` (with `UNITE_TOP_K: 10`).
 
 Additionally, we have listed the models that have been tested in `tested_models.yaml`. However, this does not mean that the latest models not included in the list won't work; it just means we do not guarantee them.
 </details>

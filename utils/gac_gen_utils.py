@@ -21,6 +21,118 @@ from .logger import setup_custom_logger
 
 logger = setup_custom_logger("TSP")
 
+# 各集成算法在日志中显示的名称，根据算法名称统一维护，避免在多处硬编码
+ENSEMBLE_METHOD_DISPLAY = {"gac": "GaC", "unite": "UniTE"}
+EXTRA_EOS_TOKENS = ("<|end_of_text|>", "<|endoftext|>", "<|im_end|>", "<|end|>")
+EXTRA_BANNED_SPECIAL_TOKENS = {
+    "<|user|>",
+    "<think>",
+    "</think>",
+    "<｜begin▁of▁sentence｜>",
+    "<｜end▁of▁sentence｜>",
+}
+# EXTRA_BANNED_GENERATED_TOKENS = {
+#     "10", "tac", "与合作", "中的作用", "主要通过", "主要集中在",
+#     "人道", "以下几个方面", "但不", "体能", "以确保", "军民",
+#     "分发", "制定的", "动向", "可能的", "合作的", "和控制",
+#     "和维护", "士气", "并为", "并将其", "并根据", "影响着",
+#     "必要时", "拥有的", "撤退", "敌方", "方的", "时间的",
+#     "是基于", "是该", "权衡", "杀伤", "环境的", "猎人",
+#     "答案是", "的计划", "等多", "线性", "表现形式", "规划和",
+#     "警戒", "详细信息", "资源的", "造就", "部的", "队的",
+#     "限于", "顺利进行", "风险评估",
+# }
+
+
+def log_unite_step(
+    mode,
+    unite_top_k,
+    selected_tokens,
+    candidate_counts=None,
+    selected_scores=None,
+    reason=None,
+):
+    parts = [
+        "UNITE_STEP",
+        f"mode={mode}",
+        f"top_k={unite_top_k}",
+        f"selected={selected_tokens}",
+    ]
+    if candidate_counts is not None:
+        parts.append(f"candidate_count={candidate_counts}")
+    if selected_scores is not None:
+        parts.append(f"selected_score={selected_scores}")
+    if reason is not None:
+        parts.append(f"reason={reason}")
+    logger.info(" | ".join(parts) + "\n")
+
+
+def collect_token_strings(value):
+    token_strings = set()
+    if value is None:
+        return token_strings
+    if isinstance(value, str):
+        if value:
+            token_strings.add(value)
+        return token_strings
+    if isinstance(value, dict):
+        for item in value.values():
+            token_strings.update(collect_token_strings(item))
+        return token_strings
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            token_strings.update(collect_token_strings(item))
+        return token_strings
+
+    content = getattr(value, "content", None)
+    if isinstance(content, str) and content:
+        token_strings.add(content)
+    return token_strings
+
+
+def build_eos_token_set(tokenizers):
+    eos_token_set = set(EXTRA_EOS_TOKENS)
+    for tokenizer in tokenizers:
+        eos_token_set.update(collect_token_strings(getattr(tokenizer, "eos_token", None)))
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is None:
+            continue
+        eos_token_ids = eos_token_id if isinstance(eos_token_id, (list, tuple, set)) else [eos_token_id]
+        for token_id in eos_token_ids:
+            if token_id is None:
+                continue
+            eos_token_set.add(
+                tokenizer.decode([token_id], skip_special_tokens=False)
+            )
+    return eos_token_set
+
+
+def build_banned_special_token_set(tokenizers, eos_token_set):
+    banned_token_set = set(EXTRA_BANNED_SPECIAL_TOKENS)
+    # banned_token_set.update(EXTRA_BANNED_GENERATED_TOKENS)
+    for tokenizer in tokenizers:
+        banned_token_set.update(
+            collect_token_strings(getattr(tokenizer, "all_special_tokens", None))
+        )
+        banned_token_set.update(
+            collect_token_strings(getattr(tokenizer, "additional_special_tokens", None))
+        )
+        banned_token_set.update(
+            collect_token_strings(getattr(tokenizer, "special_tokens_map", None))
+        )
+
+        all_special_ids = getattr(tokenizer, "all_special_ids", None)
+        if all_special_ids is None:
+            continue
+        for token_id in all_special_ids:
+            if token_id is None:
+                continue
+            banned_token_set.add(
+                tokenizer.decode([token_id], skip_special_tokens=False)
+            )
+
+    return banned_token_set - eos_token_set
+
 
 def generate_ensemnble_response(
     model_actors_list,
@@ -34,6 +146,12 @@ def generate_ensemnble_response(
     primary_index,
     threshold,
     until,
+    ensemble_method="gac",
+    unite_top_k=10,
+    unite_renorm=True,
+    id_to_str_list=None,
+    str_to_ids_list=None,
+    core_cfg=None,
     **kwargs,
 ):
     # Initiate asynchronous preparation for text generation across multiple model actors.
@@ -45,6 +163,19 @@ def generate_ensemnble_response(
         ensemble_weight_list.append(model_actor.get_ensemble_weight.remote())
     ray.get(refs)
     ensemble_weight_list = ray.get(ensemble_weight_list)
+    if ensemble_method == "unite":
+        logger.info(
+            "UNITE_REQUEST | selection=union-top-k "
+            f"| top_k={unite_top_k} | renorm={unite_renorm} "
+            f"| model_count={len(model_actors_list)} "
+            f"| weights={[round(float(w), 4) for w in ensemble_weight_list]}"
+        )
+
+    # Precompute EOS/banned token sets once per request: they depend only on the
+    # tokenizers, so recomputing them every decoding step (as before) was pure overhead.
+    eos_token_set = build_eos_token_set(tokenizers)
+    eos_token_list = list(eos_token_set)
+    banned_token_set = build_banned_special_token_set(tokenizers, eos_token_set)
 
     cached_output_ids = [
         [] for _ in ray.get(model_actors_list[0].get_input_ids.remote())
@@ -66,19 +197,64 @@ def generate_ensemnble_response(
 
         # Merge probability distributions from different models to identify a unified token,
         # then map this token to corresponding IDs across models using tokenizer and vocabulary mappings.
-        merged_token_ids = merge_and_convert_tokens(
-            tmp_outputs,
-            tokenizers,
-            mapping_matrices,
-            vocab_union,
-            index_to_vocab,
-            special_prefix_tokens_dict,
-            byte_mappings_list,
-            primary_index,
-            threshold,
-            need_ensemble,
-            tmp_outputs_times,
-        )
+        # The ensemble algorithm is selected by `ensemble_method`; GaC is the default.
+        if ensemble_method == "unite":
+            merged_token_ids = merge_and_convert_tokens_unite(
+                tmp_outputs,
+                tokenizers,
+                id_to_str_list,
+                str_to_ids_list,
+                special_prefix_tokens_dict,
+                byte_mappings_list,
+                primary_index,
+                threshold,
+                need_ensemble,
+                tmp_outputs_times,
+                ensemble_weight_list,
+                unite_top_k,
+                eos_token_set,
+                eos_token_list,
+                banned_token_set,
+                unite_renorm,
+            )
+        elif core_cfg is not None and core_cfg.get("USE_CORE"):
+            # GaC + CoRE: same union-vocab fusion as GaC, but reweighted by token- and
+            # model-level consistency (see merge_and_convert_tokens_core).
+            merged_token_ids = merge_and_convert_tokens_core(
+                tmp_outputs,
+                tokenizers,
+                mapping_matrices,
+                vocab_union,
+                index_to_vocab,
+                special_prefix_tokens_dict,
+                byte_mappings_list,
+                primary_index,
+                threshold,
+                need_ensemble,
+                tmp_outputs_times,
+                eos_token_set,
+                eos_token_list,
+                banned_token_set,
+                ensemble_weight_list,
+                core_cfg,
+            )
+        else:
+            merged_token_ids = merge_and_convert_tokens(
+                tmp_outputs,
+                tokenizers,
+                mapping_matrices,
+                vocab_union,
+                index_to_vocab,
+                special_prefix_tokens_dict,
+                byte_mappings_list,
+                primary_index,
+                threshold,
+                need_ensemble,
+                tmp_outputs_times,
+                eos_token_set,
+                eos_token_list,
+                banned_token_set,
+            )
 
         # check whether should early stopping
         cached_output_ids, merged_token_ids = check_until(
@@ -242,7 +418,9 @@ def update_input_ids_and_model_kwargs(model, state):
     device = input_ids.device
 
     # Calculate the maximum length after adding next_tokens
-    max_length = max([input_ids.shape[1] + len(tokens) for tokens in next_tokens])
+    has_multi_token_step = any(len(tokens) > 1 for tokens in next_tokens)
+    max_new_tokens = max(len(tokens) for tokens in next_tokens)
+    max_length = input_ids.shape[1] + max_new_tokens
 
     # Pad input_ids and next_tokens to the same length
     padded_input_ids = []
@@ -250,33 +428,42 @@ def update_input_ids_and_model_kwargs(model, state):
     for i, tokens in enumerate(next_tokens):
         # Calculate padding size for input_ids
         input_padding_size = max_length - input_ids.shape[1] - len(tokens)
-
-        # Pad input_ids
-        padded_input = torch.cat(
-            [
-                torch.full(
-                    (1, input_padding_size),
-                    pad_token_id,
-                    dtype=torch.long,
-                    device=device,
-                ),
-                input_ids[i].unsqueeze(0),
-                torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0),
-            ],
-            dim=1,
+        token_tensor = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+        pad_tensor = torch.full(
+            (1, input_padding_size),
+            pad_token_id,
+            dtype=torch.long,
+            device=device,
         )
+
+        # For normal single-token decoding no padding is needed. For multi-token
+        # consensus steps, pad inside the newly appended block so the cached old
+        # context keeps the same columns and cache_position can address only new ids.
+        if has_multi_token_step:
+            padded_input = torch.cat(
+                [input_ids[i].unsqueeze(0), pad_tensor, token_tensor],
+                dim=1,
+            )
+        else:
+            padded_input = torch.cat(
+                [pad_tensor, input_ids[i].unsqueeze(0), token_tensor],
+                dim=1,
+            )
         padded_input_ids.append(padded_input)
 
         # Update the attention mask
         if "attention_mask" in model_kwargs:
             original_attention_mask = model_kwargs["attention_mask"][i]
-            updated_attention_mask = torch.cat(
-                [
-                    torch.zeros(input_padding_size, dtype=torch.long, device=device),
-                    original_attention_mask,
-                    torch.ones(len(tokens), dtype=torch.long, device=device),
-                ]
-            )
+            pad_mask = torch.zeros(input_padding_size, dtype=torch.long, device=device)
+            token_mask = torch.ones(len(tokens), dtype=torch.long, device=device)
+            if has_multi_token_step:
+                updated_attention_mask = torch.cat(
+                    [original_attention_mask, pad_mask, token_mask]
+                )
+            else:
+                updated_attention_mask = torch.cat(
+                    [pad_mask, original_attention_mask, token_mask]
+                )
             attention_masks.append(updated_attention_mask)
 
     # Convert the list of padded input_ids to a tensor
@@ -294,29 +481,25 @@ def update_input_ids_and_model_kwargs(model, state):
             device=model_kwargs["attention_mask"].device,
         )
 
-    # Update model_kwargs, set past_key_values to None if any sequence has more than one token to add
-    if any(len(tokens) > 1 for tokens in next_tokens):
-        model_kwargs["past_key_values"] = None
-
-        # Find the index of the first non-pad token for each sequence
-        first_non_pad_indices = [
-            input_id.ne(pad_token_id).nonzero(as_tuple=True)[0][0].item()
-            if pad_token_id in input_id
-            else 0
-            for input_id in padded_input_ids_tensor
-        ]
-
-        # Calculate the maximum number of leading pads that can be removed (minimum index of the first non-pad token)
-        max_pads_to_remove = min(first_non_pad_indices)
-
-        # Remove the unnecessary leading pads
-        if max_pads_to_remove > 0:
-
-            padded_input_ids_tensor = padded_input_ids_tensor[:, max_pads_to_remove:]
-            if "attention_mask" in model_kwargs:
-                model_kwargs["attention_mask"] = model_kwargs["attention_mask"][
-                    :, max_pads_to_remove:
-                ]
+    # Multi-token consensus strings can appear in UniTE when the chosen string is
+    # atomic for one tokenizer but splits in another. Keep incremental decoding by
+    # feeding only the newly appended sub-token block on the next forward pass.
+    # Clearing the cache here makes the next step reprocess the whole context and
+    # materialize full-sequence logits, which is the large UniTE-specific memory
+    # spike seen on long AIME-style generations.
+    if has_multi_token_step:
+        old_seq_len = input_ids.shape[1]
+        new_seq_len = padded_input_ids_tensor.shape[1]
+        model_kwargs["cache_position"] = torch.arange(
+            old_seq_len,
+            new_seq_len,
+            dtype=torch.int64,
+            device=padded_input_ids_tensor.device,
+        )
+        logger.warning(
+            "A consensus token split into multiple sub-tokens; keeping KV cache "
+            f"and advancing cache_position={model_kwargs['cache_position'].tolist()}."
+        )
 
     # Update unfinished_sequences based on eos_token_id
     if eos_token_id_tensor is not None:
@@ -397,6 +580,10 @@ def get_vocab_union_and_mapping(tokenizers):
                                 tokenizer's vocabulary. This mapping is used to ensure consistency
                                 and to facilitate the identification and replacement of these tokens
                                 in the unified vocabulary.
+        - id_to_str_list (list): One dict per tokenizer mapping each model token id to its
+                                canonical union string (used by the lightweight UniTE path).
+        - str_to_ids_list (list): One dict per tokenizer mapping each canonical union string
+                                to the list of model token ids that decode to it.
     """
     # Initialize a set to store all tokens
     vocab_union = set()
@@ -491,7 +678,33 @@ def get_vocab_union_and_mapping(tokenizers):
                     continue
             mapping[original_token_id] = vocab_to_index[hex_token]
 
-    return vocab_union, tokenizers_mapping, index_to_vocab, byte_mappings_list
+    # Derive lightweight per-model string maps that share the EXACT same canonicalization
+    # as the union above (so UniTE candidate matching is guaranteed consistent with GaC):
+    #   - id_to_str_list[i]: model token id -> canonical union string
+    #   - str_to_ids_list[i]: canonical union string -> list of model token ids
+    #     (a list because distinct model ids can decode to the same canonical string,
+    #      mirroring how the GaC sparse projection sums them).
+    # UniTE uses these instead of building/using the GPU sparse mapping matrices.
+    id_to_str_list = []
+    str_to_ids_list = []
+    for mapping in tokenizers_mapping:
+        id_to_str = {}
+        str_to_ids = {}
+        for token_id, union_index in mapping.items():
+            token_str = index_to_vocab[union_index]
+            id_to_str[token_id] = token_str
+            str_to_ids.setdefault(token_str, []).append(token_id)
+        id_to_str_list.append(id_to_str)
+        str_to_ids_list.append(str_to_ids)
+
+    return (
+        vocab_union,
+        tokenizers_mapping,
+        index_to_vocab,
+        byte_mappings_list,
+        id_to_str_list,
+        str_to_ids_list,
+    )
 
 
 def create_mapping_matrix(mapping, union_vocab_size, model_vocab_size):
@@ -609,6 +822,288 @@ def check_threshold_ensemble(tmp_outputs_refs, primary_index, threshold):
     return outputs, outputs_times, need_ensemble
 
 
+def convert_tokens_to_model_ids(
+    max_tokens,
+    tokenizers,
+    eos_token_list,
+    special_prefix_token,
+    byte_mappings_list,
+):
+    """
+    Converts the chosen union-vocabulary token strings into the corresponding token
+    IDs for each model's tokenizer. EOS tokens map to each tokenizer's eos_token_id;
+    other tokens are re-tokenized via get_token_ids (keeping every sub-token id when a
+    token splits into multiple, so each model's context stays aligned with the chosen
+    consensus token). Shared by the GaC and UniTE ensembling paths.
+
+    Args:
+        max_tokens (list of str): The chosen token string for each batch element.
+        tokenizers (list): Tokenizer per model.
+        eos_token_list (list of str): Token strings that should be treated as EOS.
+        special_prefix_token (dict): Mapping from tokenizer to its special prefix token.
+        byte_mappings_list (list of dict): Byte-value token mapping per tokenizer.
+
+    Returns:
+        list: A nested list of token IDs; one inner list per tokenizer/model.
+    """
+    batch_token_ids = [
+        [] for _ in range(len(tokenizers))
+    ]  # Initialize list for each model
+    for i, tokenizer in enumerate(tokenizers):
+        for token in max_tokens:
+            if token in eos_token_list:
+                token_id = [tokenizer.eos_token_id]
+            else:
+                # Convert token to corresponding tokenizer's token IDs using special_prefix_token
+                token_id = get_token_ids(
+                    tokenizer,
+                    token,
+                    special_prefix_token[tokenizer],
+                    byte_mappings_list[i],
+                )
+                # The chosen consensus token may not be an atomic token in this model's
+                # vocabulary, so it can split into several sub-token IDs. We feed ALL of
+                # them back: dropping the tail (as before, with token_id[:1]) left this
+                # model's context holding only a prefix fragment of the consensus token,
+                # so its context diverged from the models that do have it as one token.
+                # update_input_ids_and_model_kwargs handles appending multiple tokens.
+                if len(token_id) > 1:
+                    logger.warning(
+                        f"Token '{token}' maps to multiple token IDs {token_id} for tokenizer "
+                        f"{type(tokenizer)}; feeding all sub-tokens to keep contexts aligned."
+                    )
+
+            batch_token_ids[i].append(token_id)  # Append token IDs for each batch
+
+    return batch_token_ids
+
+
+def merge_and_convert_tokens_unite(
+    outputs,
+    tokenizers,
+    id_to_str_list,
+    str_to_ids_list,
+    special_prefix_token,
+    byte_mappings_list,
+    primary_index,
+    threshold,
+    need_ensemble,
+    tmp_outputs_times,
+    ensemble_weight_list,
+    unite_top_k,
+    eos_token_set,
+    eos_token_list,
+    banned_token_set,
+    unite_renorm=True,
+):
+    """
+    UniTE (Union Top-k Ensembling) — lightweight implementation.
+
+    Unlike GaC, this does NOT project every model onto a full union-vocabulary vector.
+    It works directly on each model's own next-token distribution and only aligns the
+    small union of the models' top-k tokens (string level), so the per-step cost is
+    O(n_models * top_k) instead of O(union_vocab_size):
+
+      1. For each model take torch.topk over its OWN vocabulary and map the chosen ids
+         to canonical strings via id_to_str_list (the SAME canonicalization GaC uses).
+      2. Candidate set S = union of those strings (banned/special tokens filtered),
+         kept in insertion order so tie-breaking is deterministic/reproducible.
+      3. Each model votes on every candidate string `s`:
+         - In-vocab: `s` is an atomic token of this model (s in str_to_ids_list[i]) ->
+           use the sum of probabilities of all ids decoding to `s` (matches what GaC's
+           sparse projection would have summed).
+         - Out-of-vocab: `s` is not a single token of this model -> re-tokenize it with
+           this model and use the FIRST sub-token's probability (cheap UniTE criterion-3
+           approximation; resolved ids are gathered in one GPU->CPU read per model).
+         - unite_renorm=True (default, faithful UniTE): renormalize each model over S
+           (cancels the baked-in ensemble weight), then combine as a weighted average.
+           False: sum the absolute model-weighted probabilities (a "GaC on the candidate
+           set" variant).
+      4. Pick argmax over S.
+
+    Note on weighting: the actor pre-multiplies each model by its ensemble weight
+    (outputs[i] = model_ensemble_weight_i * softmax_i). When renormalizing, that factor
+    cancels and we re-apply the normalized weight explicitly; when not renormalizing the
+    weight is already baked in, so we sum directly and must NOT multiply by weights[i].
+
+    eos/banned sets are precomputed once by the caller and passed in (they depend only on
+    the tokenizers). Returns the same nested list of per-model token IDs as GaC.
+    """
+    for i, output in enumerate(outputs):
+        if need_ensemble:
+            if output is None:
+                raise ValueError(
+                    "We detect a probability vector of None, which need to excute ensemble!"
+                )
+        else:
+            if output is not None and i != primary_index:
+                raise ValueError(
+                    "We detect a probability vector from non-primary model, but no ensemble excuted!"
+                )
+
+    # Threshold gate decided not to ensemble: use the primary model's own top token.
+    if not need_ensemble:
+        primary_output = outputs[primary_index]
+        primary_id_to_str = id_to_str_list[primary_index]
+        batch_size = primary_output.size(0)
+        max_tokens = []
+        candidate_counts = []
+        selected_scores = []
+        for b in range(batch_size):
+            top = torch.topk(primary_output[b], k=unite_top_k, dim=-1)
+            top_ids = top.indices.tolist()
+            top_vals = top.values.tolist()
+            chosen_token = None
+            chosen_score = None
+            for tid, val in zip(top_ids, top_vals):
+                token_str = primary_id_to_str.get(tid)
+                if token_str is not None and token_str not in banned_token_set:
+                    chosen_token = token_str
+                    chosen_score = val
+                    break
+            if chosen_token is None:
+                fallback_id = top_ids[0]
+                chosen_token = primary_id_to_str.get(
+                    fallback_id,
+                    tokenizers[primary_index].decode([fallback_id], skip_special_tokens=False),
+                )
+                chosen_score = top_vals[0]
+            max_tokens.append(chosen_token)
+            candidate_counts.append(len(top_ids))
+            selected_scores.append(round(float(chosen_score), 6))
+        log_unite_step(
+            mode="primary-only",
+            unite_top_k=unite_top_k,
+            selected_tokens=max_tokens,
+            candidate_counts=candidate_counts,
+            selected_scores=selected_scores,
+            reason="primary-confidence-above-threshold",
+        )
+        return convert_tokens_to_model_ids(
+            max_tokens, tokenizers, eos_token_list, special_prefix_token, byte_mappings_list
+        )
+
+    n_models = len(outputs)
+
+    # Normalize ensemble weights so they form a convex combination (defaults to 1/n
+    # under NORM_TYPE 'average'); falls back to equal weights if they sum to 0.
+    weight_sum = float(sum(ensemble_weight_list))
+    if weight_sum <= 0:
+        weights = [1.0 / n_models] * n_models
+    else:
+        weights = [float(w) / weight_sum for w in ensemble_weight_list]
+
+    batch_size = outputs[0].size(0)
+    # Step 1: per-model top-k over each model's OWN vocabulary (no union projection).
+    topk_per_model = [torch.topk(outputs[i], k=unite_top_k, dim=-1) for i in range(n_models)]
+
+    max_tokens = []
+    candidate_counts = []
+    selected_scores = []
+    for b in range(batch_size):
+        # Step 2: candidate set S = union of each model's top-k token strings.
+        cand_strs = []
+        cand_set = set()
+        raw_first = None  # fallback (most-confident mapped token) if everything is banned
+        for i in range(n_models):
+            ids_b = topk_per_model[i].indices[b].tolist()
+            id_to_str = id_to_str_list[i]
+            for tid in ids_b:
+                s = id_to_str.get(tid)
+                if s is None:
+                    continue
+                if raw_first is None:
+                    raw_first = s
+                if s in banned_token_set:
+                    continue
+                if s not in cand_set:
+                    cand_set.add(s)
+                    cand_strs.append(s)
+        if not cand_strs:
+            cand_strs = [raw_first]
+            logger.warning("All UniTE candidates are special tokens. Keeping top-1 for fallback.")
+        candidate_counts.append(len(cand_strs))
+
+        n_cand = len(cand_strs)
+        avg_probs = [0.0] * n_cand
+
+        # Step 3: each model votes over S.
+        for i in range(n_models):
+            output_b = outputs[i][b]
+            str_to_ids = str_to_ids_list[i]
+            # Collect, per candidate, the model token id(s) whose probabilities we need,
+            # then read them all back in a single GPU->CPU transfer.
+            flat_ids = []
+            spans = []  # (start, end) into flat_ids per candidate; empty span -> 0 prob
+            for s in cand_strs:
+                ids = str_to_ids.get(s)
+                if ids:  # in-vocab: atomic token(s) of model i decoding to s
+                    start = len(flat_ids)
+                    flat_ids.extend(ids)
+                    spans.append((start, len(flat_ids)))
+                else:  # OOV (criterion 3): re-tokenize, take the first sub-token
+                    if s in eos_token_set:
+                        sub_ids = [tokenizers[i].eos_token_id]
+                    else:
+                        sub_ids = get_token_ids(
+                            tokenizers[i],
+                            s,
+                            special_prefix_token[tokenizers[i]],
+                            byte_mappings_list[i],
+                        )
+                    if sub_ids and sub_ids[0] is not None and 0 <= sub_ids[0] < output_b.size(0):
+                        start = len(flat_ids)
+                        flat_ids.append(sub_ids[0])
+                        spans.append((start, len(flat_ids)))
+                    else:
+                        spans.append((0, 0))  # unresolved -> contributes 0
+
+            if flat_ids:
+                gathered = output_b[
+                    torch.tensor(flat_ids, dtype=torch.long, device=output_b.device)
+                ].tolist()
+            else:
+                gathered = []
+            per_model = [sum(gathered[start:end]) for (start, end) in spans]
+
+            if unite_renorm:
+                # Faithful UniTE: renormalize this model over S (cancels the baked-in
+                # ensemble weight), then re-apply the normalized weight (weighted average).
+                total = sum(per_model)
+                if total > 0.0:
+                    inv = 1.0 / total
+                    for k in range(n_cand):
+                        avg_probs[k] += weights[i] * per_model[k] * inv
+                else:
+                    uni = weights[i] / n_cand
+                    for k in range(n_cand):
+                        avg_probs[k] += uni
+            else:
+                # "GaC on the candidate set": per_model already carries weight_i (baked into
+                # outputs[i]), so sum the absolute probabilities directly.
+                for k in range(n_cand):
+                    avg_probs[k] += per_model[k]
+
+        # Step 4: argmax over S. cand_strs is banned-filtered and insertion-ordered, so
+        # iterating range(n_cand) makes max() break ties by insertion order (deterministic).
+        best_k = max(range(n_cand), key=lambda k: avg_probs[k])
+        max_tokens.append(cand_strs[best_k])
+        selected_scores.append(round(float(avg_probs[best_k]), 6))
+
+    log_unite_step(
+        mode="union-top-k",
+        unite_top_k=unite_top_k,
+        selected_tokens=max_tokens,
+        candidate_counts=candidate_counts,
+        selected_scores=selected_scores,
+        reason=f"renorm={unite_renorm}",
+    )
+
+    return convert_tokens_to_model_ids(
+        max_tokens, tokenizers, eos_token_list, special_prefix_token, byte_mappings_list
+    )
+
+
 def merge_and_convert_tokens(
     outputs,
     tokenizers,
@@ -621,9 +1116,12 @@ def merge_and_convert_tokens(
     threshold,
     need_ensemble,
     tmp_outputs_times,
+    eos_token_set,
+    eos_token_list,
+    banned_token_set,
 ):
     """
-    Merges the probability vectors from multiple models' outputs and converts the 
+    Merges the probability vectors from multiple models' outputs and converts the
     highest probability tokens into corresponding token IDs for each tokenizer. The 
     function also handles special token replacements to ensure correct formatting and
     uses a special prefix token for tokenization processes.
@@ -644,15 +1142,14 @@ def merge_and_convert_tokens(
     threshold(float): tokens with conf lower than threshold will be ensembled.
     need_ensemble (bool): A flag indicating whether ensemble processing is needed.
     tmp_outputs_times (list of float): Consumed time for each model.
-                            
+    eos_token_set (set): Precomputed EOS token strings across all tokenizers.
+    eos_token_list (list): list(eos_token_set), precomputed by the caller.
+    banned_token_set (set): Precomputed banned/special token strings across all tokenizers.
+
     Returns:
-    list: A nested list of token IDs, where each inner list corresponds to the token IDs 
+    list: A nested list of token IDs, where each inner list corresponds to the token IDs
           for each tokenizer, based on the highest probability token from the merged output.
     """
-    eos_token_list = [tokenizer.eos_token for tokenizer in tokenizers]
-    eos_token_list.extend(["<|end_of_text|>", "<|endoftext|>", "<|im_end|>", "<|end|>"])
-    banned_token_set = {"<|user|>", "<think>", "</think>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>"}
-
     for i, output in enumerate(outputs):
         if need_ensemble:
             if output is None:
@@ -710,36 +1207,240 @@ def merge_and_convert_tokens(
     
     logger.info(f"Token chosen by GaC: {str(max_tokens)}\n")
 
-    # Convert to token IDs for each tokenizer
-    batch_token_ids = [
-        [] for _ in range(len(tokenizers))
-    ]  # Initialize list for each model
-    for i, tokenizer in enumerate(tokenizers):
-        for token in max_tokens:
-            if token in eos_token_list:
-                token_id = [tokenizer.eos_token_id]
-            else:
-                # Convert token to corresponding tokenizer's token IDs using special_prefix_token
-                token_id = get_token_ids(
-                    tokenizer,
-                    token,
-                    special_prefix_token[tokenizer],
-                    byte_mappings_list[i],
+    # Convert the chosen union tokens back into per-model token IDs.
+    return convert_tokens_to_model_ids(
+        max_tokens,
+        tokenizers,
+        eos_token_list,
+        special_prefix_token,
+        byte_mappings_list,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CoRE: Consistency-based robust ensemble (Zeng et al., EACL 2026).
+# These helpers augment the GaC union-vocab fusion with token-level and
+# model-level consistency. They are only used when USE_CORE is enabled; the
+# vanilla GaC / UniTE paths are untouched.
+# ---------------------------------------------------------------------------
+
+_CORE_EPS = 1e-12
+
+
+def _core_row_entropy(x):
+    """Per-distribution entropy over the last (vocabulary) dimension.
+
+    Args:
+        x (torch.Tensor): shape (..., V), non-negative weights (need not sum to 1).
+    Returns:
+        torch.Tensor: shape (..., 1), the entropy of each normalized row.
+    """
+    row_sum = x.sum(dim=-1, keepdim=True).clamp_min(_CORE_EPS)
+    p = (x / row_sum).clamp_min(_CORE_EPS)
+    return -(p * torch.log(p)).sum(dim=-1, keepdim=True)
+
+
+def compute_core_scores(aligned, variant, task_type, hparams):
+    """Compute CoRE token- and model-level consistency scores.
+
+    Faithful port of ``compute_consist_score`` from the official CoRE implementation
+    (logits_processor.py), generalized to operate in GaC's union vocabulary and to
+    support a batch dimension. The main (anchor) model must be at row 0.
+
+    Args:
+        aligned (torch.Tensor): shape (N, B, V) — each model's probability distribution
+            aligned to the union vocabulary, with the main model at index 0.
+        variant (str): consistency function, one of
+            {consist-rbf, consist-power, consist-sig, consist-linear, consist-rec}.
+        task_type (str): 'generation' or 'classification' (selects the model-weight formula).
+        hparams (dict): consistency-function hyperparameters (beta/alpha/gamma/k).
+
+    Returns:
+        token_scores (torch.Tensor): shape (N, B, V), the token-level low-pass filter.
+        model_scores (torch.Tensor): shape (N, B, 1), simplex-normalized model weights.
+    """
+    # Reference (barycenter) distribution: uniform average across models (Eq. 1).
+    p_star = aligned.mean(dim=0, keepdim=True)              # (1,B,V)
+    diff = torch.abs(aligned - p_star)                     # (N,B,V)
+
+    # Mask impossible tokens (no mass in either this model or the main model).
+    p_mask = ((aligned + aligned[0:1]) > _CORE_EPS).float()  # (N,B,V)
+
+    if variant == "consist-linear":
+        token_scores = p_mask * (1 - diff)
+    elif variant == "consist-power":
+        alpha = hparams.get("alpha", 5.0)
+        token_scores = p_mask * (1 - diff).clamp(min=0) ** alpha
+    elif variant == "consist-rbf":
+        beta = hparams.get("beta", 2.0)
+        beta_t = torch.tensor(beta, dtype=aligned.dtype, device=aligned.device)
+        token_scores = p_mask * (torch.exp(-beta * diff) - torch.exp(-beta_t)) / (1 - torch.exp(-beta_t))
+    elif variant == "consist-rec":
+        gamma = hparams.get("gamma", 1.0)
+        tmp = 1 / (1 + gamma * diff)
+        token_scores = p_mask * (tmp - tmp.min()) / (tmp.max() - tmp.min() + 1e-8)
+    elif variant == "consist-sig":
+        k = hparams.get("k", 5.0)
+        token_scores = p_mask * (1 - torch.sigmoid(k * (diff - 0.5)))
+    else:
+        raise ValueError(f"Unknown CoRE variant {variant}")
+
+    # Per-model (and per-batch) normalization to keep scores comparable across variants.
+    # token_scores_sum (the raw sum) doubles as the numerator of the model-level score.
+    nonzero_count = (token_scores != 0).sum(dim=-1, keepdim=True).float()  # (N,B,1)
+    token_scores_sum = token_scores.sum(dim=-1, keepdim=True)              # (N,B,1)
+    token_scores = token_scores / (token_scores_sum + _CORE_EPS) * nonzero_count
+
+    p_ent = _core_row_entropy(aligned)  # (N,B,1)
+
+    # Model-level consistency: reward agreement (token_scores_sum) and confidence (1/entropy).
+    if task_type == "generation":
+        model_scores = token_scores_sum / (p_ent + _CORE_EPS)
+    elif task_type == "classification":
+        model_scores = 1 / (p_ent + _CORE_EPS)
+    else:
+        raise ValueError(f"Unknown CoRE task_type {task_type}")
+
+    # Clip the main model weight to preserve a strong anchor (>= 0.5 after normalization).
+    model_scores = model_scores.clone()
+    sum_excl_main = model_scores.sum(dim=0, keepdim=True) - model_scores[0:1]  # (1,B,1)
+    model_scores[0:1] = torch.maximum(model_scores[0:1], sum_excl_main)
+    model_scores = model_scores / model_scores.sum(dim=0, keepdim=True).clamp_min(_CORE_EPS)
+
+    return token_scores, model_scores
+
+
+def merge_and_convert_tokens_core(
+    outputs,
+    tokenizers,
+    mapping_matrices,
+    vocab_union,
+    index_to_vocab,
+    special_prefix_token,
+    byte_mappings_list,
+    primary_index,
+    threshold,
+    need_ensemble,
+    tmp_outputs_times,
+    eos_token_set,
+    eos_token_list,
+    banned_token_set,
+    ensemble_weight_list,
+    core_cfg,
+):
+    """GaC + CoRE fusion.
+
+    Mirrors ``merge_and_convert_tokens`` but, instead of a plain weighted sum, reweights
+    the aligned distributions with CoRE's token- and model-level consistency. The config
+    ``score`` weights are intentionally superseded by the consistency-derived weights; the
+    raw scores only determine which model is the anchor (``core_main_index``).
+
+    Returns the same nested list of per-model token IDs as ``merge_and_convert_tokens``.
+    """
+    for i, output in enumerate(outputs):
+        if need_ensemble:
+            if output is None:
+                raise ValueError(
+                    "We detect a probability vector of None, which need to excute ensemble!"
                 )
-                if len(token_id) > 1:
-                    logger.warning(
-                        f"Warning: Token '{token}' is tokenized into multiple token IDs {token_id} by tokenizer {type(tokenizer)}."
-                    )
-                    token_id = token_id[:1]  # Take only the first token ID
+        else:
+            if output is not None and i != primary_index:
+                raise ValueError(
+                    "We detect a probability vector from non-primary model, but no ensemble excuted!"
+                )
 
-            batch_token_ids[i].append(token_id)  # Append token IDs for each batch
+    task_type = core_cfg["task_type"]
+    variant = core_cfg["variant"]
+    hparams = core_cfg["hparams"]
+    check_substring = core_cfg["check_substring"]
+    main_index = core_cfg["core_main_index"]
 
-    return batch_token_ids
+    if need_ensemble:
+        # Recover each model's unit-sum softmax (the actor bakes in the config weight, which
+        # CoRE replaces), then project into the union vocabulary via the GaC mapping matrices.
+        aligned_list = []
+        for output, mapping_matrix, weight in zip(outputs, mapping_matrices, ensemble_weight_list):
+            softmax_probs = output.float() / max(float(weight), _CORE_EPS)
+            aligned_list.append(torch.sparse.mm(softmax_probs, mapping_matrix.float()))  # (B, V)
+
+        # Put the anchor model at row 0 so the consistency math matches the paper's convention.
+        order = [main_index] + [i for i in range(len(aligned_list)) if i != main_index]
+        aligned = torch.stack([aligned_list[j] for j in order], dim=0)  # (N, B, V)
+
+        token_scores, model_scores = compute_core_scores(aligned, variant, task_type, hparams)
+
+        # p_ens = w_main * p_main + sum_i w_i * (s^t_i (.) p_i); token consistency on assists only.
+        merged_probs = model_scores[0] * aligned[0]  # (B, V)
+        for i in range(1, aligned.size(0)):
+            if task_type == "generation":
+                merged_probs = merged_probs + model_scores[i] * aligned[i] * token_scores[i]
+            else:  # classification: model-level weighting only
+                merged_probs = merged_probs + model_scores[i] * aligned[i]
+
+        main_aligned = aligned[0]  # anchor distribution, for substring fallback
+    else:
+        # Thresholded ensemble, primary model confident: fall back to the primary model only.
+        merged_probs = torch.sparse.mm(
+            outputs[primary_index].float(), mapping_matrices[primary_index].float()
+        )
+        main_aligned = merged_probs
+        logger.info("GaC+CoRE do not ensemble in this step.")
+
+    top_k = 10
+    top_k_probs, top_k_indices = torch.topk(merged_probs, k=top_k, dim=-1)
+    use_substring = check_substring and need_ensemble and task_type == "generation"
+    max_tokens = []
+    batch_size = merged_probs.size(0)
+    for b in range(batch_size):
+        chosen_token = None
+        for k in range(top_k):
+            idx = top_k_indices[b, k].item()
+            token_str = index_to_vocab[idx]
+            if token_str not in banned_token_set:
+                chosen_token = token_str
+                break
+        if chosen_token is None:
+            idx = top_k_indices[b, 0].item()
+            chosen_token = index_to_vocab[idx]
+            logger.warning(f"All top-{top_k} tokens are banned. Forcing top-1: {chosen_token}")
+
+        # CoRE substring resolution: if the ensemble token and the anchor model's top token
+        # are prefixes of each other, keep the anchor token (avoids misalignment artifacts).
+        if use_substring:
+            main_top_idx = torch.argmax(main_aligned[b]).item()
+            main_top_token = index_to_vocab[main_top_idx]
+            if (
+                main_top_token not in banned_token_set
+                and chosen_token != main_top_token
+                and (chosen_token.startswith(main_top_token) or main_top_token.startswith(chosen_token))
+            ):
+                chosen_token = main_top_token
+
+        max_tokens.append(chosen_token)
+
+    logger.info(f"Token chosen by GaC+CoRE: {str(max_tokens)}\n")
+
+    # Convert the chosen union tokens back into per-model token IDs.
+    return convert_tokens_to_model_ids(
+        max_tokens,
+        tokenizers,
+        eos_token_list,
+        special_prefix_token,
+        byte_mappings_list,
+    )
+
+
+# Memoizes get_token_ids results, keyed by (id(tokenizer), token). The same candidate
+# strings recur on every decoding step, and each miss costs up to four tokenizer.encode
+# calls, so caching is essential for the UniTE hot path (and helps convert_tokens_to_model_ids
+# for GaC too). special_prefix_token / byte_mapping are deterministic per tokenizer, so they
+# do not need to be part of the key.
+_TOKEN_IDS_CACHE = {}
 
 
 def get_token_ids(tokenizer, token, special_prefix_token, byte_mapping):
     """
-    Tokenizes a given token and a special prefix token from the tokenizer's vocabulary, 
+    Tokenizes a given token and a special prefix token from the tokenizer's vocabulary,
     then finds the token IDs for the portion of the given token that does not overlap 
     with the special prefix token. It is particularly useful for identifying unique sub-tokens 
     in tokenization processes. If initial tokenization does not meet expectations,
@@ -765,9 +1466,16 @@ def get_token_ids(tokenizer, token, special_prefix_token, byte_mapping):
     the token IDs for 'token'.
     """
 
+    cache_key = (id(tokenizer), token)
+    cached = _TOKEN_IDS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     # Check if the token is a standard byte representation and return its token ID if found
     if token in byte_mapping:
-        return [byte_mapping[token]]
+        result_ids = [byte_mapping[token]]
+        _TOKEN_IDS_CACHE[cache_key] = result_ids
+        return result_ids
 
     if byte_mapping != 128:
         prefix_tokens = [special_prefix_token, ";"]
@@ -785,11 +1493,14 @@ def get_token_ids(tokenizer, token, special_prefix_token, byte_mapping):
             if token_id_list2[: len(token_id_list1)] == token_id_list1:
                 result = token_id_list2[len(token_id_list1) :]
                 if result:
+                    _TOKEN_IDS_CACHE[cache_key] = result
                     return result
 
         # If tokenization doesn't match as expected with any prefix token, return the token IDs for 'token'
         logger.warning(f"Warning: Token '{token}' may not be tokenized as expected.")
-    return tokenizer.encode(token, add_special_tokens=False)
+    result_ids = tokenizer.encode(token, add_special_tokens=False)
+    _TOKEN_IDS_CACHE[cache_key] = result_ids
+    return result_ids
 
 
 def find_special_underscore_token(tokenizer):
@@ -1137,6 +1848,8 @@ def greedy_search(
         "eos_token_id_tensor": eos_token_id_tensor,
         "unfinished_sequences": unfinished_sequences,
         "this_peer_finished": this_peer_finished,
+        "start_length": input_ids.shape[-1],
+        "max_length": stopping_criteria.max_length,
     }
 
 
@@ -1177,14 +1890,28 @@ def get_one_token(model, state):
     # model_inputs['use_cache'] = False
     # model_inputs['past_key_values'] = None
 
+    forward_kwargs = {
+        **model_inputs,
+        "return_dict": True,
+        "output_attentions": output_attentions,
+        "output_hidden_states": output_hidden_states,
+    }
+    logits_limit_kwarg = state.get("logits_limit_kwarg")
+    if logits_limit_kwarg is None and "logits_limit_kwarg" not in state:
+        forward_params = inspect.signature(model.forward).parameters
+        if "logits_to_keep" in forward_params:
+            logits_limit_kwarg = "logits_to_keep"
+        elif "num_logits_to_keep" in forward_params:
+            logits_limit_kwarg = "num_logits_to_keep"
+        else:
+            logits_limit_kwarg = ""
+        state["logits_limit_kwarg"] = logits_limit_kwarg
+    if logits_limit_kwarg:
+        forward_kwargs[logits_limit_kwarg] = 1
+
     with torch.no_grad():
         # forward pass to get next token
-        outputs = model(
-            **model_inputs,
-            return_dict=True,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-        )
+        outputs = model(**forward_kwargs)
 
     next_token_logits = outputs.logits[:, -1, :]
 

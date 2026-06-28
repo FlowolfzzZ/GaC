@@ -7,7 +7,7 @@ from .ray_actor import get_remote_model_generator_class
 from .gac_gen_utils import *
 import numpy as np
 
-def setup_model_actors_and_data(config: List[Dict], norm_type: str, threshold: float) -> Tuple[List[Any], List[Any], Set[str], List[Dict[int, int]], Dict[int, str], Dict[Any, str], List[Dict[str, int]], int]:
+def setup_model_actors_and_data(config: List[Dict], norm_type: str, threshold: float, ensemble_method: str = "gac", core_cfg: Dict = None) -> Tuple[List[Any], List[Any], Set[str], List[Dict[int, int]], Dict[int, str], Dict[Any, str], List[Dict[str, int]], int]:
     """
     Sets up model actors based on configurations and preprocesses necessary data for text generation.
 
@@ -35,20 +35,49 @@ def setup_model_actors_and_data(config: List[Dict], norm_type: str, threshold: f
         - model_name_list (List[str]): list of model name in model_actors_list
         - primary_index (int)
         - threshold (float)
+        - id_to_str_list (List[Dict[int, str]]): per-model token id -> canonical union string (UniTE).
+        - str_to_ids_list (List[Dict[str, List[int]]]): per-model canonical union string -> token ids (UniTE).
     """
+    # Capture the user-specified raw scores BEFORE update_scores rewrites them (in
+    # 'average' mode every score becomes 1). CoRE uses the raw scores to pick its anchor
+    # ("main") model when no explicit CORE_MAIN_INDEX is given and no primary model exists.
+    raw_scores = [c.get('score', 1) for c in config]
+
     update_scores(config, norm_type)
     config = normalize_scores(config)
     logger.info(f"Model ensemble weights: {[(c['name'], round(c['score'],4)) for c in config]}")
 
     # find primary model
     primary_index = check_priorities(config)
+
+    # Resolve the CoRE anchor ("main") model. Priority: explicit CORE_MAIN_INDEX override >
+    # the gate model (primary_index) when set > the model with the highest raw config score
+    # (ties -> first). Only relevant when CoRE is enabled.
+    if core_cfg is not None and core_cfg.get('USE_CORE'):
+        if core_cfg.get('main_index') is not None:
+            core_main_index = core_cfg['main_index']
+            if core_main_index >= len(config):
+                raise ValueError(
+                    f"CORE_MAIN_INDEX={core_main_index} is out of range for {len(config)} models."
+                )
+        elif primary_index != -1:
+            core_main_index = primary_index
+        else:
+            core_main_index = int(np.argmax(raw_scores))
+        core_cfg['core_main_index'] = core_main_index
+        logger.info(
+            f"CORE_CONFIG | enabled | variant={core_cfg['variant']} "
+            f"| task_type={core_cfg['task_type']} "
+            f"| main_model={config[core_main_index]['name']} (index {core_main_index}) "
+            f"| check_substring={core_cfg['check_substring']} | hparams={core_cfg['hparams']}"
+        )
     if primary_index != -1:
         real_threshold = threshold*config[primary_index]["score"]
         logger.info(f"Gate model is {config[primary_index]['name']} with threshold {threshold}, and other ensembled models KV cache will be disabled!\nPlease note that for threshold ensemble, we currently only support batch size = 1.")
 
     else:
         real_threshold = threshold = 1
-        logger.info(f"Every token will be ensembled, meaning the threshold will not be ignored!")
+        logger.info("Ensemble mode: every-token | threshold=ignored")
 
     config = validate_and_update_quantization(config)
 
@@ -73,18 +102,29 @@ def setup_model_actors_and_data(config: List[Dict], norm_type: str, threshold: f
     special_prefix_tokens_dict = get_special_prefix_tokens_for_all(tokenizers)
 
     # Create a unified vocabulary and mappings for tokenizers
-    vocab_union, tokenizers_mapping, index_to_vocab, byte_mappings_list = get_vocab_union_and_mapping(
-        tokenizers
-    )
+    (
+        vocab_union,
+        tokenizers_mapping,
+        index_to_vocab,
+        byte_mappings_list,
+        id_to_str_list,
+        str_to_ids_list,
+    ) = get_vocab_union_and_mapping(tokenizers)
 
     model_vocab_size_list = [
         ray.get(model_actor.get_vocab_size.remote()) for model_actor in model_actors_list
     ]
 
-    mapping_matrices = [
-        create_mapping_matrix(mapping, len(vocab_union), vocab_size)
-        for mapping, tokenizer, vocab_size in zip(tokenizers_mapping, tokenizers, model_vocab_size_list)
-    ]
+    # UniTE works directly on each model's own top-k tokens and the lightweight string
+    # maps above, so it does NOT need the GPU sparse projection matrices (nor the per-step
+    # full-vocabulary sparse.mm). Only build them for GaC.
+    if ensemble_method == "unite":
+        mapping_matrices = None
+    else:
+        mapping_matrices = [
+            create_mapping_matrix(mapping, len(vocab_union), vocab_size)
+            for mapping, tokenizer, vocab_size in zip(tokenizers_mapping, tokenizers, model_vocab_size_list)
+        ]
 
     # Find the minimum max position embeddings across all models
     min_max_position_embeddings = min(
@@ -104,8 +144,10 @@ def setup_model_actors_and_data(config: List[Dict], norm_type: str, threshold: f
         model_name_list,
         primary_index,
         real_threshold,
+        id_to_str_list,
+        str_to_ids_list,
     )
-    
+
 def validate_and_update_quantization(model_config: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
     Validates the 'quantization' field in each dictionary of a list of model configurations,
@@ -290,7 +332,7 @@ def update_scores(config, norm_type):
 def load_yaml_config(yaml_file_path):
     with open(yaml_file_path, 'r') as file:
         config = yaml.safe_load(file)
-    
+
     try:
         config_api_server = config['CONFIG_API_SERVER']
         norm_type_api_server = config['NORM_TYPE_API_SERVER']
@@ -298,7 +340,111 @@ def load_yaml_config(yaml_file_path):
     except KeyError as e:
         raise ValueError(f"Missing required configuration key: {e}")
 
-    return config_api_server, norm_type_api_server, threshold_api_server
+    # Optional switch to select the ensembling algorithm. Defaults to 'gac' so
+    # existing configs (without these keys) keep the original GaC behavior.
+    ensemble_method = config.get('ENSEMBLE_METHOD', 'gac')
+    valid_ensemble_methods = {'gac', 'unite'}
+    if ensemble_method not in valid_ensemble_methods:
+        raise ValueError(
+            f"Invalid ENSEMBLE_METHOD: '{ensemble_method}'. Expected one of {valid_ensemble_methods}."
+        )
+
+    # Top-k used by UniTE (ignored by GaC). Default 10 follows the UniTE paper.
+    unite_top_k = config.get('UNITE_TOP_K', 10)
+    if not isinstance(unite_top_k, int) or unite_top_k <= 0:
+        raise ValueError(f"Invalid UNITE_TOP_K: '{unite_top_k}'. Expected a positive integer.")
+
+    # Whether UniTE renormalizes each model's probabilities over the candidate set.
+    # Defaults to True: the faithful UniTE behavior — each model's probabilities are
+    # renormalized over the candidate set S and then combined as a weighted average.
+    # Set to False to instead keep the absolute (model-weighted) probabilities and sum
+    # them like GaC (a "GaC restricted to the candidate set" variant). Ignored by GaC.
+    unite_renorm = config.get('UNITE_RENORM', True)
+    if not isinstance(unite_renorm, bool):
+        raise ValueError(f"Invalid UNITE_RENORM: '{unite_renorm}'. Expected a boolean.")
+
+    # Optional CoRE augmentation (paper: "Harnessing Consistency for Robust Test-Time LLM
+    # Ensemble"). CoRE rides on top of the GaC union-vocab path: it harnesses token- and
+    # model-level consistency to robustly reweight the ensemble. All keys are optional;
+    # when USE_CORE is False (the default) the GaC/UniTE behaviour is completely unchanged.
+    core_cfg = parse_core_config(config, ensemble_method)
+
+    return (
+        config_api_server,
+        norm_type_api_server,
+        threshold_api_server,
+        ensemble_method,
+        unite_top_k,
+        unite_renorm,
+        core_cfg,
+    )
+
+
+def parse_core_config(config, ensemble_method):
+    """
+    Parse and validate the optional CoRE-related keys from a loaded YAML config.
+
+    Returns a dict with the resolved CoRE settings. ``core_main_index`` is left as the
+    user-provided override (or None) here; the concrete anchor model is resolved later in
+    ``setup_model_actors_and_data`` once priorities/raw scores are known.
+    """
+    use_core = config.get('USE_CORE', False)
+    if not isinstance(use_core, bool):
+        raise ValueError(f"Invalid USE_CORE: '{use_core}'. Expected a boolean.")
+
+    valid_variants = {
+        'consist-rbf', 'consist-power', 'consist-sig', 'consist-linear', 'consist-rec'
+    }
+    variant = config.get('CORE_VARIANT', 'consist-rbf')
+    if variant not in valid_variants:
+        raise ValueError(
+            f"Invalid CORE_VARIANT: '{variant}'. Expected one of {valid_variants}."
+        )
+
+    valid_task_types = {'generation', 'classification'}
+    task_type = config.get('CORE_TASK_TYPE', 'generation')
+    if task_type not in valid_task_types:
+        raise ValueError(
+            f"Invalid CORE_TASK_TYPE: '{task_type}'. Expected one of {valid_task_types}."
+        )
+
+    main_index = config.get('CORE_MAIN_INDEX', None)
+    if main_index is not None and (not isinstance(main_index, int) or main_index < 0):
+        raise ValueError(
+            f"Invalid CORE_MAIN_INDEX: '{main_index}'. Expected a non-negative integer."
+        )
+
+    check_substring = config.get('CORE_CHECK_SUBSTRING', True)
+    if not isinstance(check_substring, bool):
+        raise ValueError(
+            f"Invalid CORE_CHECK_SUBSTRING: '{check_substring}'. Expected a boolean."
+        )
+
+    # CoRE here augments only the union-vocab GaC path; it is not implemented for UniTE's
+    # candidate-set fusion, so reject that combination early with a clear message.
+    if use_core and ensemble_method == 'unite':
+        raise ValueError(
+            "USE_CORE is only supported with the GaC ensemble method, not UniTE. "
+            "Set ENSEMBLE_METHOD to 'gac' (or omit it) to use CoRE."
+        )
+
+    # Consistency-function hyperparameters (paper defaults).
+    hparams = {
+        'beta': float(config.get('CORE_BETA', 2.0)),    # consist-rbf
+        'alpha': float(config.get('CORE_ALPHA', 5.0)),  # consist-power
+        'gamma': float(config.get('CORE_GAMMA', 1.0)),  # consist-rec
+        'k': float(config.get('CORE_K', 5.0)),          # consist-sig
+    }
+
+    return {
+        'USE_CORE': use_core,
+        'variant': variant,
+        'task_type': task_type,
+        'main_index': main_index,        # user override (or None -> auto)
+        'core_main_index': None,         # resolved anchor, filled in by setup
+        'check_substring': check_substring,
+        'hparams': hparams,
+    }
 
 # init RAY
 ray.init()
